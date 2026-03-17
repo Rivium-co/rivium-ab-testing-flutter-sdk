@@ -1,3 +1,7 @@
+## 0.1.0+2
+
+- Comprehensive README with full usage examples and API reference
+
 ## 0.1.0+1
 
 - Updated documentation and README
