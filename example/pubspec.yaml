@@ -1,0 +1,13 @@
+name: rivium_ab_testing_example
+description: Example app for Rivium AB Testing SDK
+
+publish_to: 'none'
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  rivium_ab_testing:
+    path: ../
