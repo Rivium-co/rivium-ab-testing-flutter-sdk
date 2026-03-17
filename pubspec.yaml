@@ -1,6 +1,6 @@
 name: rivium_ab_testing
 description: A/B Testing SDK for Flutter - Run experiments and feature flags with Rivium. Pure Dart, works on all platforms.
-version: 0.1.0
+version: 0.1.0+1
 homepage: https://rivium.co
 repository: https://github.com/Rivium-co/rivium-ab-testing-flutter-sdk
 
