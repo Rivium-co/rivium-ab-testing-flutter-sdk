@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
-import 'package:http/http.dart' as http;
 import 'package:connectivity_plus/connectivity_plus.dart';
+import '../rivium_api_client.dart';
+import '../sdk_version.dart';
 import 'offline_storage.dart';
 
 /// Configuration for sync manager
@@ -42,10 +43,13 @@ enum SyncEvent {
 
 /// Manages offline event sync with the RiviumAbTesting server
 class SyncManager {
-  final String apiKey;
-  final String baseUrl;
+  final RiviumApiClient api;
   final OfflineStorage storage;
   final SyncCallback? onSyncEvent;
+
+  /// The signed-in user. With a user token the service credits every event in
+  /// a batch to the token's user, so only this user's events may be sent.
+  final String? Function()? currentUserId;
 
   SyncConfig _config;
   Timer? _syncTimer;
@@ -54,10 +58,10 @@ class SyncManager {
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
 
   SyncManager({
-    required this.apiKey,
-    required this.baseUrl,
+    required this.api,
     required this.storage,
     this.onSyncEvent,
+    this.currentUserId,
     SyncConfig? config,
   }) : _config = config ?? const SyncConfig();
 
@@ -139,7 +143,19 @@ class SyncManager {
     onSyncEvent?.call(SyncEvent.syncStarted, null);
 
     try {
-      final events = await storage.getOfflineEvents();
+      var events = await storage.getOfflineEvents();
+
+      // Another user's leftover events can't be sent under this user's
+      // token: they would be credited to the wrong person.
+      if (api.usesUserToken) {
+        final userId = currentUserId?.call();
+        final own = events.where((e) => e.userId == userId).toList();
+        if (own.length != events.length) {
+          await storage.saveOfflineEvents(own);
+          events = own;
+        }
+      }
+
       if (events.isEmpty) {
         return SyncResult(synced: 0, failed: 0, pending: 0);
       }
@@ -148,13 +164,7 @@ class SyncManager {
       final batch = events.take(_config.maxBatchSize).toList();
       final deviceId = await storage.getOrCreateDeviceId();
 
-      final response = await http.post(
-        Uri.parse('$baseUrl/public/sync'),
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-        },
-        body: jsonEncode({
+      final response = await api.post('/public/sync', {
           'events': batch.map((e) => <String, dynamic>{
               'experimentId': e.experimentId,
               'variantId': e.variantId,
@@ -167,36 +177,18 @@ class SyncManager {
               'clientEventId': e.id,
             }).toList(),
           'deviceId': deviceId,
-          'sdkVersion': 'flutter-2.0.0',
-        }),
-      );
+          'sdkVersion': 'flutter-$riviumAbTestingSdkVersion',
+        });
 
       if (response.statusCode == 200) {
         final result = jsonDecode(response.body);
         final synced = result['synced'] as int? ?? 0;
         final failed = result['failed'] as int? ?? 0;
 
-        // Remove successfully synced events
-        final syncedIds = batch.take(synced).map((e) => e.id).toList();
-        await storage.removeOfflineEvents(syncedIds);
-
-        // Update retry count for failed events
-        if (failed > 0) {
-          final updatedEvents = await storage.getOfflineEvents();
-          final failedEvents = batch.skip(synced).toList();
-          for (final failedEvent in failedEvents) {
-            final idx = updatedEvents.indexWhere((e) => e.id == failedEvent.id);
-            if (idx != -1 && updatedEvents[idx].retryCount < _config.maxRetries) {
-              updatedEvents[idx] = updatedEvents[idx].copyWith(
-                retryCount: updatedEvents[idx].retryCount + 1,
-              );
-            } else if (idx != -1) {
-              // Remove event after max retries
-              updatedEvents.removeAt(idx);
-            }
-          }
-          await storage.saveOfflineEvents(updatedEvents);
-        }
+        // The service has taken the whole batch. Events it could not record
+        // (an experiment that no longer exists, say) would fail again, so
+        // they are not retried.
+        await storage.removeOfflineEvents(batch.map((e) => e.id).toList());
 
         final remaining = await storage.getOfflineEventCount();
 
@@ -207,6 +199,16 @@ class SyncManager {
         });
 
         return SyncResult(synced: synced, failed: failed, pending: remaining);
+      } else if (response.statusCode == 401) {
+        // No valid user token yet (or the project requires one): keep the
+        // events and send them once a token is available.
+        throw Exception('Sync not authorized: ${response.statusCode}');
+      } else if (response.statusCode >= 400 &&
+          response.statusCode < 500 &&
+          response.statusCode != 429) {
+        // The request itself is wrong; the same events cannot succeed.
+        await storage.removeOfflineEvents(batch.map((e) => e.id).toList());
+        throw Exception('Sync refused: ${response.statusCode}');
       } else {
         throw Exception('Sync failed: ${response.statusCode}');
       }

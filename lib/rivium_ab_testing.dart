@@ -36,6 +36,7 @@ library rivium_ab_testing;
 export 'src/rivium_ab_testing.dart';
 export 'src/rivium_ab_testing_config.dart';
 export 'src/rivium_ab_testing_error.dart';
+export 'src/rivium_api_client.dart' show RiviumTokenProvider;
 
 // Standalone Feature Flags
 export 'src/rivium_feature_flags.dart';

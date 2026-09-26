@@ -2,9 +2,10 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'package:crypto/crypto.dart';
-import 'package:http/http.dart' as http;
 import 'rivium_ab_testing_config.dart';
 import 'rivium_ab_testing_error.dart';
+import 'rivium_api_client.dart';
+import 'sdk_version.dart';
 import 'rivium_feature_flags.dart';
 import 'models/experiment.dart';
 import 'models/feature_flag.dart';
@@ -25,6 +26,7 @@ class RiviumAbTesting {
   final RiviumAbTestingConfig _config;
   final String _baseUrl;
 
+  late final RiviumApiClient _api;
   late final OfflineStorage _storage;
   late final SyncManager _syncManager;
   late final RiviumFeatureFlags _featureFlags;
@@ -63,6 +65,14 @@ class RiviumAbTesting {
     final sdk = RiviumAbTesting._(config: config, baseUrl: baseUrl);
     sdk._callback = callback;
 
+    sdk._api = RiviumApiClient(
+      apiKey: config.apiKey,
+      baseUrl: sdk._baseUrl,
+      tokenProvider: config.tokenProvider,
+      userToken: config.userToken,
+      debug: config.debug,
+    );
+
     sdk._storage = OfflineStorage();
     await sdk._storage.init();
 
@@ -74,10 +84,10 @@ class RiviumAbTesting {
 
     // Initialize sync manager
     sdk._syncManager = SyncManager(
-      apiKey: config.apiKey,
-      baseUrl: sdk._baseUrl,
+      api: sdk._api,
       storage: sdk._storage,
       onSyncEvent: sdk._onSyncEvent,
+      currentUserId: () => sdk._userId,
     );
     await sdk._syncManager.init();
 
@@ -88,6 +98,7 @@ class RiviumAbTesting {
       debug: config.debug,
       storage: sdk._storage,
       isOnline: sdk._syncManager.isOnline,
+      api: sdk._api,
       callback: callback != null
           ? (event, data) => callback(event, data)
           : null,
@@ -108,8 +119,20 @@ class RiviumAbTesting {
   }
 
   /// Set user ID for experiment assignment and feature flag targeting
+  ///
+  /// Call it again on login and logout. When the user changes, the last
+  /// user's pending events are sent first (under their own token), then
+  /// their variants, attributes and token are dropped.
   Future<void> setUserId(String userId) async {
     _ensureInitialized();
+    if (userId != _userId) {
+      if (_userId != null && _syncManager.isOnline) {
+        await _syncManager.sync();
+      }
+      await _storage.clearAssignmentCache();
+      _userAttributes = {};
+      _api.clearToken();
+    }
     _userId = userId;
     await _storage.saveUserId(userId);
     await _featureFlags.setUserId(userId);
@@ -153,18 +176,11 @@ class RiviumAbTesting {
     // Try server assignment if online
     if (_syncManager.isOnline) {
       try {
-        final response = await http.post(
-          Uri.parse('$_baseUrl/public/assign'),
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': _config.apiKey,
-          },
-          body: jsonEncode({
-            'experimentKey': experimentKey,
-            'userId': _userId,
-            'userAttributes': _userAttributes,
-          }),
-        );
+        final response = await _api.post('/public/assign', {
+          'experimentKey': experimentKey,
+          'userId': _userId,
+          'userAttributes': _userAttributes,
+        });
 
         if (response.statusCode == 200) {
           final body = jsonDecode(response.body);
@@ -543,6 +559,7 @@ class RiviumAbTesting {
     if (_isInitialized) {
       await _storage.clearAll();
       _syncManager.dispose();
+      _api.clearToken();
     }
     _userId = null;
     _userAttributes = {};
@@ -625,15 +642,9 @@ class RiviumAbTesting {
     try {
       // Fetch experiments (has key fields) and config in parallel
       final results = await Future.wait([
-        http.get(
-          Uri.parse('$_baseUrl/public/experiments'),
-          headers: {'x-api-key': _config.apiKey},
-        ),
-        http.get(
-          Uri.parse(
-              '$_baseUrl/public/init?platform=flutter&sdkVersion=2.0.0'),
-          headers: {'x-api-key': _config.apiKey},
-        ),
+        _api.get('/public/experiments'),
+        _api.get(
+            '/public/init?platform=flutter&sdkVersion=$riviumAbTestingSdkVersion'),
       ]);
 
       final experimentsResponse = results[0];

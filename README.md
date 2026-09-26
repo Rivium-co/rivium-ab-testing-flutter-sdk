@@ -42,10 +42,18 @@ import 'package:rivium_ab_testing/rivium_ab_testing.dart';
 
 // 1. Initialize the SDK
 await RiviumAbTesting.init(
-  RiviumAbTestingConfig(apiKey: 'rv_live_xxx'),
+  RiviumAbTestingConfig(
+    apiKey: 'rv_live_xxx',
+    // Your server mints this for the signed-in user (see "User tokens").
+    tokenProvider: () async {
+      final res = await http.post(Uri.parse('https://your-api.example.com/rivium-token'),
+          headers: {'Authorization': 'Bearer $yourSessionToken'});
+      return jsonDecode(res.body)['token'] as String;
+    },
+  ),
 );
 
-// 2. Set user ID
+// 2. Set user ID (call again on login/logout; the last user's data is dropped)
 await RiviumAbTesting.instance.setUserId('user-123');
 
 // 3. Get variant for an experiment
@@ -58,6 +66,26 @@ await RiviumAbTesting.instance.trackConversion('checkout-redesign', value: 49.99
 // 5. Force sync pending events
 await RiviumAbTesting.instance.flush();
 ```
+
+## User tokens
+
+The API key ships inside your app, so anyone can read it. On its own it can't
+prove which user a request is for. Your server can: it holds your project's
+**server secret** and mints a short-lived token for the signed-in user
+(`POST https://auth.rivium.co/users/token`, or `createUserToken()` in the
+Node.js SDK). The SDK sends it with every request, and the service takes the
+user from the token instead of from the app.
+
+The SDK calls `tokenProvider` when it needs a token, again shortly before it
+expires, and once more if the service reports it expired. Calling `setUserId`
+with a different user sends the last user's pending events first, then drops
+their variants and token.
+
+A token is **required**: assigning variants, tracking events and
+evaluating flags are refused without one (reading the experiment and flag
+lists is not, so the app can load them before anyone signs in). The same token works for Rivium Chat and Sync.
+
+**Never put the server secret in the app.**
 
 ## A/B Testing
 
@@ -187,7 +215,7 @@ await RiviumAbTesting.instance.flush();
 ```dart
 // Initialize with debug logging
 await RiviumAbTesting.init(
-  RiviumAbTestingConfig(apiKey: 'rv_live_xxx', debug: true),
+  RiviumAbTestingConfig(apiKey: 'rv_live_xxx', tokenProvider: fetchRiviumToken),
   callback: (event, data) {
     print('SDK event: $event, data: $data');
   },

@@ -1,8 +1,8 @@
 import 'dart:convert';
 import 'package:crypto/crypto.dart';
-import 'package:http/http.dart' as http;
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'rivium_feature_flags_config.dart';
+import 'rivium_api_client.dart';
 import 'rivium_ab_testing_error.dart';
 import 'models/feature_flag.dart';
 import 'offline/offline_storage.dart';
@@ -30,6 +30,7 @@ class RiviumFeatureFlags {
   static RiviumFeatureFlags? _instance;
 
   final RiviumFeatureFlagsConfig _config;
+  late final RiviumApiClient _api;
   OfflineStorage? _storage;
   List<CachedFeatureFlag> _cachedFlags = [];
   String? _userId;
@@ -60,6 +61,13 @@ class RiviumFeatureFlags {
 
     final sdk = RiviumFeatureFlags._(config: config);
     sdk._callback = callback;
+    sdk._api = RiviumApiClient(
+      apiKey: config.apiKey,
+      baseUrl: config.baseUrl,
+      tokenProvider: config.tokenProvider,
+      userToken: config.userToken,
+      debug: config.debug,
+    );
 
     // Initialize offline cache if enabled
     if (config.enableOfflineCache) {
@@ -98,6 +106,7 @@ class RiviumFeatureFlags {
     required OfflineStorage storage,
     required bool isOnline,
     FeatureFlagCallback? callback,
+    RiviumApiClient? api,
   }) async {
     final config = RiviumFeatureFlagsConfig(
       apiKey: apiKey,
@@ -106,6 +115,8 @@ class RiviumFeatureFlags {
       enableOfflineCache: true,
     );
     final sdk = RiviumFeatureFlags._(config: config);
+    // Shares the parent SDK's client, so both send the same user token.
+    sdk._api = api ?? RiviumApiClient(apiKey: apiKey, baseUrl: baseUrl, debug: debug);
     sdk._storage = storage;
     sdk._callback = callback;
     sdk._cachedFlags = await storage.getCachedFlags();
@@ -117,6 +128,11 @@ class RiviumFeatureFlags {
   /// Set user ID for rollout and targeting
   Future<void> setUserId(String userId) async {
     _ensureInitialized();
+    if (userId != _userId) {
+      // Another person: the last user's attributes and token are not theirs.
+      _userAttributes = {};
+      _api.clearToken();
+    }
     _userId = userId;
     await _storage?.saveUserId(userId);
   }
@@ -137,18 +153,11 @@ class RiviumFeatureFlags {
     // Try server evaluation if online
     if (_isOnline) {
       try {
-        final response = await http.post(
-          Uri.parse('${_config.baseUrl}/public/flag-evaluation'),
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': _config.apiKey,
-          },
-          body: jsonEncode({
-            'flagKey': flagKey,
-            'userId': _userId ?? '',
-            'userAttributes': _userAttributes,
-          }),
-        );
+        final response = await _api.post('/public/flag-evaluation', {
+          'flagKey': flagKey,
+          'userId': _userId ?? '',
+          'userAttributes': _userAttributes,
+        });
 
         if (response.statusCode == 200) {
           final data = jsonDecode(response.body);
@@ -177,18 +186,11 @@ class RiviumFeatureFlags {
     // Try server evaluation if online
     if (_isOnline) {
       try {
-        final response = await http.post(
-          Uri.parse('${_config.baseUrl}/public/flag-evaluation'),
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': _config.apiKey,
-          },
-          body: jsonEncode({
-            'flagKey': flagKey,
-            'userId': _userId ?? '',
-            'userAttributes': _userAttributes,
-          }),
-        );
+        final response = await _api.post('/public/flag-evaluation', {
+          'flagKey': flagKey,
+          'userId': _userId ?? '',
+          'userAttributes': _userAttributes,
+        });
 
         if (response.statusCode == 200) {
           final data = jsonDecode(response.body);
@@ -217,10 +219,7 @@ class RiviumFeatureFlags {
 
     if (_isOnline) {
       try {
-        final response = await http.get(
-          Uri.parse('${_config.baseUrl}/public/flags'),
-          headers: {'x-api-key': _config.apiKey},
-        );
+        final response = await _api.get('/public/flags');
 
         if (response.statusCode == 200) {
           final data = jsonDecode(response.body);
@@ -305,6 +304,7 @@ class RiviumFeatureFlags {
     _cachedFlags = [];
     _userId = null;
     _userAttributes = {};
+    _api.clearToken();
     _isInitialized = false;
     _instance = null;
   }
@@ -326,10 +326,7 @@ class RiviumFeatureFlags {
 
   Future<void> _fetchFlags() async {
     try {
-      final response = await http.get(
-        Uri.parse('${_config.baseUrl}/public/flags'),
-        headers: {'x-api-key': _config.apiKey},
-      );
+      final response = await _api.get('/public/flags');
 
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
@@ -484,7 +481,14 @@ class RiviumFeatureFlags {
         return value.contains(rule['contains'] as String);
       }
       if (rule.containsKey('regex') && value is String) {
-        return RegExp(rule['regex'] as String).hasMatch(value);
+        // The pattern comes from the flag's rules. A malformed one must not
+        // break flag evaluation, and a huge input must not stall the app.
+        if (value.length > 1000) return false;
+        try {
+          return RegExp(rule['regex'] as String).hasMatch(value);
+        } catch (_) {
+          return false;
+        }
       }
       if (rule.containsKey('exists')) {
         return rule['exists'] == true ? value != null : value == null;
