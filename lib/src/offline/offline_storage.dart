@@ -499,6 +499,11 @@ class OfflineStorage {
     await prefs.setString(_userIdKey, userId);
   }
 
+  Future<void> removeUserId() async {
+    final prefs = _prefs ?? await SharedPreferences.getInstance();
+    await prefs.remove(_userIdKey);
+  }
+
   Future<String> getOrCreateDeviceId() async {
     final prefs = _prefs ?? await SharedPreferences.getInstance();
     var deviceId = prefs.getString(_deviceIdKey);

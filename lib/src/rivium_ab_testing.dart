@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
-import 'package:crypto/crypto.dart';
 import 'rivium_ab_testing_config.dart';
 import 'rivium_ab_testing_error.dart';
 import 'rivium_api_client.dart';
@@ -37,6 +36,15 @@ class RiviumAbTesting {
   bool _isInitialized = false;
 
   RiviumAbTestingCallback? _callback;
+  void Function()? _onAwaitingUserToken;
+
+  /// Experiments the app asked about while no variant could be fetched.
+  /// Their assignments are fetched once a user token is there.
+  final Set<String> _wantedExperiments = {};
+
+  /// Variants the service gave to a user who is not part of the experiment
+  /// (targeting, traffic). Kept for this run only: never a sticky assignment.
+  final Map<String, String> _notInExperiment = {};
 
   RiviumAbTesting._({
     required RiviumAbTestingConfig config,
@@ -53,6 +61,11 @@ class RiviumAbTesting {
   }
 
   /// Initialize the SDK
+  ///
+  /// May be called before anyone is signed in: without a user token the SDK
+  /// waits for one (see [isAwaitingUserToken]). [baseUrl] must be https;
+  /// plain http is accepted only for local development (localhost,
+  /// 127.0.0.1, 10.0.2.2).
   static Future<RiviumAbTesting> init(
     RiviumAbTestingConfig config, {
     RiviumAbTestingCallback? callback,
@@ -89,23 +102,48 @@ class RiviumAbTesting {
       onSyncEvent: sdk._onSyncEvent,
       currentUserId: () => sdk._userId,
     );
-    await sdk._syncManager.init();
+    try {
+      await sdk._syncManager.init();
 
-    // Initialize feature flags (shares storage, no separate singleton)
-    sdk._featureFlags = await RiviumFeatureFlags.createInternal(
-      apiKey: config.apiKey,
-      baseUrl: sdk._baseUrl,
-      debug: config.debug,
-      storage: sdk._storage,
-      isOnline: sdk._syncManager.isOnline,
-      api: sdk._api,
-      callback: callback != null
-          ? (event, data) => callback(event, data)
-          : null,
-    );
+      // Initialize feature flags (shares storage, no separate singleton)
+      sdk._featureFlags = await RiviumFeatureFlags.createInternal(
+        apiKey: config.apiKey,
+        baseUrl: sdk._baseUrl,
+        debug: config.debug,
+        storage: sdk._storage,
+        isOnline: sdk._syncManager.isOnline,
+        api: sdk._api,
+        callback: callback != null
+            ? (event, data) => callback(event, data)
+            : null,
+      );
+      final savedUserId = sdk._userId;
+      if (savedUserId != null) {
+        await sdk._featureFlags.setUserId(savedUserId);
+      }
+    } catch (_) {
+      // Leave nothing running, so init can simply be called again.
+      sdk._syncManager.dispose();
+      rethrow;
+    }
+
+    sdk._api
+      ..onAwaitingUserToken = sdk._handleAwaitingUserToken
+      ..onUserTokenReady = sdk._resume
+      ..onTokenUser = sdk._handleTokenUser
+      ..onSignedOut = (() => sdk._switchUser(null))
+      ..onTokenRejected = (code) => sdk._callback?.call('error', {
+            'message': 'User token rejected: $code',
+            'code': code,
+          });
 
     sdk._isInitialized = true;
     _instance = sdk;
+
+    // A token from the config says who the user is.
+    if (config.userToken != null) {
+      await sdk._api.start();
+    }
 
     // Fetch fresh experiments and flags if online
     if (sdk._syncManager.isOnline) {
@@ -115,36 +153,92 @@ class RiviumAbTesting {
 
     callback?.call('initialized', {'offline': !sdk._syncManager.isOnline});
 
+    // Ask the provider for the first token. Without one the SDK waits.
+    if (config.userToken == null) {
+      unawaited(sdk._api.start());
+    }
+
     return sdk;
   }
 
   /// Set user ID for experiment assignment and feature flag targeting
   ///
-  /// Call it again on login and logout. When the user changes, the last
-  /// user's pending events are sent first (under their own token), then
-  /// their variants, attributes and token are dropped.
+  /// Use the same id your server puts in the user token. Call it again on
+  /// login. When the user changes, the last user's pending events are sent
+  /// first (under their own token only), then their variants, attributes,
+  /// remaining events and token are dropped. On logout call [clearUserId].
   Future<void> setUserId(String userId) async {
-    _ensureInitialized();
-    if (userId != _userId) {
-      if (_userId != null && _syncManager.isOnline) {
-        await _syncManager.sync();
-      }
-      await _storage.clearAssignmentCache();
-      _userAttributes = {};
-      _api.clearToken();
+    if (!_usable('setUserId')) return;
+    final previous = _userId;
+    if (userId != previous) {
+      await _switchUser(userId);
+      if (previous != null) _api.clearToken(keepUnidentified: true);
     }
-    _userId = userId;
-    await _storage.saveUserId(userId);
-    await _featureFlags.setUserId(userId);
+    // A sign-in is the usual reason for this call: if there is no token,
+    // ask for one now. The user's parked events follow it.
+    unawaited(_api.ensureToken());
+  }
+
+  /// Forget the user, for example at sign-out: their variants, attributes,
+  /// pending events and token are dropped, and the SDK waits for the next
+  /// user token.
+  Future<void> clearUserId() async {
+    if (!_usable('clearUserId')) return;
+    // Clears the user through onSignedOut.
+    await _api.setUserToken(null);
   }
 
   /// Get current user ID
   String? getUserId() => _userId;
 
+  /// True while the SDK has no user token: nobody is signed in yet, or the
+  /// token provider returned null or failed.
+  ///
+  /// While waiting, [getVariant] returns the default variant, events are
+  /// kept on the device and nothing is sent for a user. The SDK carries on
+  /// by itself once it has a token (see [setUserToken], [refreshUserToken]).
+  bool get isAwaitingUserToken =>
+      _isInitialized && _api.isAwaitingUserToken;
+
+  /// Called each time the SDK starts waiting for a user token. The
+  /// `awaitingUserToken` event of the [init] callback reports the same.
+  void onAwaitingUserToken(void Function() callback) {
+    _onAwaitingUserToken = callback;
+  }
+
+  /// Hand the SDK a user token minted by your server, for example right
+  /// after sign-in or when you refreshed it. With a
+  /// [RiviumAbTestingConfig.tokenProvider] the SDK does this for you.
+  ///
+  /// If the SDK was waiting for a token it carries on now: it fetches the
+  /// variants that were asked for meanwhile and sends the user's pending
+  /// events. A token of another user drops the last user's data first.
+  ///
+  /// Pass `null` when the user signs out (same as [clearUserId]).
+  Future<void> setUserToken(String? token) async {
+    if (!_usable('setUserToken')) return;
+    await _api.setUserToken(token);
+  }
+
+  /// Set or remove the token provider after [init]. The provider is asked
+  /// straight away.
+  Future<void> setTokenProvider(RiviumTokenProvider? provider) async {
+    if (!_usable('setTokenProvider')) return;
+    await _api.setTokenProvider(provider);
+  }
+
+  /// Ask the token provider again now. Call this when the user signs in or
+  /// out. Does nothing without a provider.
+  Future<void> refreshUserToken() async {
+    if (!_usable('refreshUserToken')) return;
+    await _api.refreshUserToken();
+  }
+
   /// Set user attributes for targeting
   void setUserAttributes(Map<String, dynamic> attributes) {
-    _ensureInitialized();
+    if (!_usable('setUserAttributes')) return;
     _userAttributes = {..._userAttributes, ...attributes};
+    _notInExperiment.clear();
     _featureFlags.setUserAttributes(attributes);
   }
 
@@ -155,76 +249,50 @@ class RiviumAbTesting {
   }
 
   /// Get variant for an experiment
+  ///
+  /// Never throws. Returns [defaultVariant] while the service cannot be
+  /// asked: no user, no user token yet ([isAwaitingUserToken]), or no
+  /// answer. A variant is decided by the service only; an assignment it gave
+  /// earlier is returned from the cache.
   Future<String> getVariant(
     String experimentKey, {
     String defaultVariant = 'control',
   }) async {
-    _ensureInitialized();
+    if (!_usable('getVariant')) return defaultVariant;
 
-    if (_userId == null) {
-      throw RiviumAbTestingError(
-          'USER_NOT_SET', 'User ID not set. Call setUserId() first.');
-    }
+    try {
+      // Check cached assignment (sticky bucketing)
+      final cachedAssignment =
+          await _storage.getCachedAssignment(experimentKey);
+      if (cachedAssignment != null) {
+        return cachedAssignment.variantName;
+      }
+      final outside = _notInExperiment[experimentKey];
+      if (outside != null) return outside;
 
-    // Check cached assignment (sticky bucketing)
-    final cachedAssignment =
-        await _storage.getCachedAssignment(experimentKey);
-    if (cachedAssignment != null) {
-      return cachedAssignment.variantName;
-    }
+      final userId = _userId;
+      if (userId == null || !_syncManager.isOnline) {
+        _wantedExperiments.add(experimentKey);
+        return defaultVariant;
+      }
 
-    // Try server assignment if online
-    if (_syncManager.isOnline) {
-      try {
-        final response = await _api.post('/public/assign', {
-          'experimentKey': experimentKey,
-          'userId': _userId,
-          'userAttributes': _userAttributes,
-        });
-
-        if (response.statusCode == 200) {
-          final body = jsonDecode(response.body);
-          final data = body['data'] as Map<String, dynamic>;
-          final variantName = data['variantName'] as String;
-
-          // Cache the assignment with full server data
-          await _storage.cacheAssignment(CachedAssignment(
-            experimentId: data['experimentId'] as String,
-            experimentKey: data['experimentKey'] as String? ?? experimentKey,
-            variantId: data['variantId'] as String,
-            variantKey: data['variantKey'] as String? ?? '',
-            variantName: variantName,
-            config: data['config'] != null
-                ? Map<String, dynamic>.from(data['config'] as Map)
-                : null,
-            isControl: data['isControl'] as bool? ?? false,
-            assignedAt: DateTime.now(),
-          ));
-
-          _callback?.call('experimentAssigned', {
-            'experimentKey': experimentKey,
-            'variantKey': data['variantKey'] ?? variantName,
-            'config': data['config'],
-          });
-
-          return variantName;
-        }
-      } catch (e) {
-        if (_config.debug) {
-          print(
-              'RiviumAbTesting: Failed to get assignment from server: $e');
-        }
+      final variant = await _assign(experimentKey, userId);
+      if (variant != null) return variant;
+      _wantedExperiments.add(experimentKey);
+    } catch (e) {
+      _wantedExperiments.add(experimentKey);
+      if (_config.debug) {
+        print('RiviumAbTesting: Failed to get assignment from server: $e');
       }
     }
 
-    // Offline fallback: local bucketing
-    return _getLocalAssignment(experimentKey, defaultVariant);
+    return defaultVariant;
   }
 
   /// Get variant configuration
   Future<Map<String, dynamic>?> getVariantConfig(
       String experimentKey) async {
-    _ensureInitialized();
+    if (!_usable('getVariantConfig')) return null;
 
     // Check cached assignment first
     final cachedAssignment =
@@ -484,13 +552,14 @@ class RiviumAbTesting {
 
   /// Refresh experiments from server
   Future<void> refreshExperiments() async {
-    _ensureInitialized();
+    if (!_usable('refreshExperiments')) return;
+    _notInExperiment.clear();
     await _fetchExperiments();
   }
 
   /// Get all experiments
   List<Experiment> getExperiments() {
-    _ensureInitialized();
+    if (!_usable('getExperiments')) return [];
     return _cachedExperiments
         .map((e) => Experiment(
               id: e.id,
@@ -516,32 +585,32 @@ class RiviumAbTesting {
   /// Check if a feature flag is enabled
   Future<bool> isFeatureEnabled(String featureKey,
       {bool defaultValue = false}) async {
-    _ensureInitialized();
+    if (!_usable('isFeatureEnabled')) return defaultValue;
     return _featureFlags.isEnabled(featureKey, defaultValue: defaultValue);
   }
 
   /// Get the value of a feature flag
   Future<dynamic> getFeatureValue(String featureKey,
       {dynamic defaultValue}) async {
-    _ensureInitialized();
+    if (!_usable('getFeatureValue')) return defaultValue;
     return _featureFlags.getValue(featureKey, defaultValue: defaultValue);
   }
 
   /// Get all feature flags
   Future<List<FeatureFlag>> getFeatureFlags() async {
-    _ensureInitialized();
+    if (!_usable('getFeatureFlags')) return [];
     return _featureFlags.getAll();
   }
 
   /// Refresh feature flags from server
   Future<void> refreshFeatureFlags() async {
-    _ensureInitialized();
+    if (!_usable('refreshFeatureFlags')) return;
     await _featureFlags.refresh();
   }
 
   /// Flush pending events to server
   Future<void> flush() async {
-    _ensureInitialized();
+    if (!_usable('flush')) return;
     await _syncManager.flush();
   }
 
@@ -550,7 +619,7 @@ class RiviumAbTesting {
 
   /// Get pending event count
   Future<int> getPendingEventCount() async {
-    _ensureInitialized();
+    if (!_usable('getPendingEventCount')) return 0;
     return _syncManager.getPendingEventCount();
   }
 
@@ -564,8 +633,10 @@ class RiviumAbTesting {
     _userId = null;
     _userAttributes = {};
     _cachedExperiments = [];
+    _wantedExperiments.clear();
+    _notInExperiment.clear();
     _isInitialized = false;
-    _instance = null;
+    if (identical(_instance, this)) _instance = null;
   }
 
   /// Dispose resources
@@ -585,6 +656,123 @@ class RiviumAbTesting {
     }
   }
 
+  /// False, with a debug note, when the SDK is not initialised. A call made
+  /// too early or after [reset] is skipped: it must not crash the app.
+  bool _usable(String method) {
+    if (_isInitialized) return true;
+    if (_config.debug) {
+      print('RiviumAbTesting: $method ignored, the SDK is not initialized');
+    }
+    return false;
+  }
+
+  /// Ask the service for [userId]'s variant. Null when there is no answer:
+  /// no user token yet, a rate limit, or an error status.
+  Future<String?> _assign(String experimentKey, String userId) async {
+    final response = await _api.post(
+      '/public/assign',
+      {
+        'experimentKey': experimentKey,
+        'userId': userId,
+        'userAttributes': _userAttributes,
+      },
+      userId: userId,
+    );
+    if (response == null ||
+        response.statusCode < 200 ||
+        response.statusCode >= 300) {
+      return null;
+    }
+
+    final body = jsonDecode(response.body);
+    final data = body['data'] as Map<String, dynamic>;
+    final variantName = data['variantName'] as String;
+
+    // The user changed while the request was on its way.
+    if (userId != _userId) return null;
+    _wantedExperiments.remove(experimentKey);
+
+    if (data['inExperiment'] == false) {
+      // Sees this variant without taking part. Not an assignment: the
+      // service is asked again next run.
+      _notInExperiment[experimentKey] = variantName;
+      return variantName;
+    }
+
+    // Cache the assignment with full server data
+    await _storage.cacheAssignment(CachedAssignment(
+      experimentId: data['experimentId'] as String,
+      experimentKey: data['experimentKey'] as String? ?? experimentKey,
+      variantId: data['variantId'] as String,
+      variantKey: data['variantKey'] as String? ?? '',
+      variantName: variantName,
+      config: data['config'] != null
+          ? Map<String, dynamic>.from(data['config'] as Map)
+          : null,
+      isControl: data['isControl'] as bool? ?? false,
+      assignedAt: DateTime.now(),
+    ));
+
+    _callback?.call('experimentAssigned', {
+      'experimentKey': experimentKey,
+      'variantKey': data['variantKey'] ?? variantName,
+      'config': data['config'],
+    });
+
+    return variantName;
+  }
+
+  /// Everything of the signed-in user goes before [next] (null: nobody)
+  /// takes over, so nothing of theirs can be sent or shown for [next].
+  Future<void> _switchUser(String? next) async {
+    final previous = _userId;
+    if (previous == next) return;
+    if (previous != null && _syncManager.isOnline) {
+      // Their own token only: the provider may already answer for [next].
+      await _syncManager.flushPinned();
+    }
+    await _storage.clearAssignmentCache();
+    _userAttributes = {};
+    _wantedExperiments.clear();
+    _notInExperiment.clear();
+    _userId = next;
+    await _syncManager.keepOnlyEventsOf(next);
+    if (next != null) {
+      await _storage.saveUserId(next);
+      await _featureFlags.setUserId(next);
+    } else {
+      await _storage.removeUserId();
+      await _featureFlags.clearUserId();
+    }
+  }
+
+  /// A token of [userId] is about to be used.
+  Future<void> _handleTokenUser(String userId) => _switchUser(userId);
+
+  void _handleAwaitingUserToken() {
+    _callback?.call('awaitingUserToken', null);
+    _onAwaitingUserToken?.call();
+  }
+
+  /// A user token is there, or the connection is back: carry on with what
+  /// was waiting for it.
+  Future<void> _resume() async {
+    if (!_isInitialized || !_syncManager.isOnline) return;
+    try {
+      final userId = _userId;
+      if (userId != null) {
+        for (final experimentKey in _wantedExperiments.toList()) {
+          await _assign(experimentKey, userId);
+        }
+      }
+      await _syncManager.flush();
+    } catch (e) {
+      if (_config.debug) {
+        print('RiviumAbTesting: Failed to continue with the user token: $e');
+      }
+    }
+  }
+
   Future<void> _trackEvent(
     String experimentKey,
     EventType eventType, {
@@ -592,12 +780,7 @@ class RiviumAbTesting {
     double? eventValue,
     Map<String, dynamic>? metadata,
   }) async {
-    _ensureInitialized();
-
-    if (_userId == null) {
-      throw RiviumAbTestingError(
-          'USER_NOT_SET', 'User ID not set. Call setUserId() first.');
-    }
+    if (!_usable('track')) return;
 
     // Resolve experiment UUID and variant UUID from cached data
     String experimentId = experimentKey;
@@ -617,11 +800,13 @@ class RiviumAbTesting {
       }
     }
 
+    // Without a user the event is parked as anonymous. It can only be sent
+    // for the user it was recorded for.
     final event = OfflineEvent(
       id: _generateEventId(),
       experimentId: experimentId,
       variantId: variantId,
-      userId: _userId!,
+      userId: _userId ?? '',
       eventType: eventType.value,
       eventName: eventName ?? eventType.value,
       eventValue: eventValue,
@@ -710,83 +895,22 @@ class RiviumAbTesting {
     }
   }
 
-  Future<String> _getLocalAssignment(
-    String experimentKey,
-    String defaultVariant,
-  ) async {
-    // Find experiment in cache by key
-    final matches =
-        _cachedExperiments.where((e) => e.key == experimentKey);
-    if (matches.isEmpty) {
-      return defaultVariant;
+  static final Random _random = _secureRandom();
+
+  static Random _secureRandom() {
+    try {
+      return Random.secure();
+    } catch (_) {
+      return Random();
     }
-
-    final experiment = matches.first;
-
-    // Check traffic allocation using experiment UUID for hashing
-    // Backend: hashUserId(userId, experimentId) -> parseInt(hex, 16)
-    // Backend: userBucket = userHash % 100
-    // Backend: if (userBucket >= experiment.trafficAllocation) -> not in experiment
-    final userHash = _getHash(_userId!, experiment.id);
-    final bucket = userHash % 100;
-
-    if (bucket >= experiment.trafficAllocation) {
-      final controlVariant = experiment.variants
-          .where((v) => v.isControl)
-          .toList();
-      return controlVariant.isNotEmpty
-          ? controlVariant.first.name
-          : defaultVariant;
-    }
-
-    // Assign to variant based on traffic split
-    // Backend: selectVariant(variants, userHash) -> sorts by name, bucket = userHash % 100, bucket < cumulative
-    final sortedVariants = [...experiment.variants]
-      ..sort((a, b) => a.name.compareTo(b.name));
-
-    int cumulativeSplit = 0;
-
-    for (final variant in sortedVariants) {
-      cumulativeSplit += variant.trafficSplit;
-      if (bucket < cumulativeSplit) {
-        await _storage.cacheAssignment(CachedAssignment(
-          experimentId: experiment.id,
-          experimentKey: experimentKey,
-          variantId: variant.id,
-          variantKey: variant.key,
-          variantName: variant.name,
-          config: variant.config,
-          isControl: variant.isControl,
-          assignedAt: DateTime.now(),
-        ));
-
-        _callback?.call('experimentAssigned', {
-          'experimentKey': experimentKey,
-          'variantKey': variant.key,
-          'config': variant.config,
-        });
-
-        return variant.name;
-      }
-    }
-
-    return defaultVariant;
   }
 
-  /// Get raw hash integer (before modulo)
-  /// Matches backend: MD5("userId:salt") -> parseInt(hex.substring(0,8), 16)
-  int _getHash(String userId, String salt) {
-    final input = '$userId:$salt';
-    final bytes = utf8.encode(input);
-    final digest = md5.convert(bytes);
-    final hashHex = digest.toString().substring(0, 8);
-    return int.parse(hashHex, radix: 16);
-  }
-
+  /// Sent as `clientEventId`, so the service stores a repeated event once.
   String _generateEventId() {
-    final random = Random();
     final timestamp = DateTime.now().millisecondsSinceEpoch;
-    final randomPart = random.nextInt(999999).toString().padLeft(6, '0');
+    final randomPart = List.generate(
+        4, (_) => _random.nextInt(0x10000).toRadixString(16).padLeft(4, '0'))
+        .join();
     return 'evt_${timestamp}_$randomPart';
   }
 
@@ -808,6 +932,12 @@ class RiviumAbTesting {
         _fetchExperiments();
         _featureFlags.updateOnlineStatus(true);
         _featureFlags.refresh();
+        // The token provider may have failed for lack of a connection.
+        if (_api.isAwaitingUserToken && _api.tokenProvider != null) {
+          unawaited(_api.refreshUserToken());
+        } else {
+          unawaited(_resume());
+        }
         break;
       default:
         break;

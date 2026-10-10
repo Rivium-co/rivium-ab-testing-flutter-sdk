@@ -14,8 +14,11 @@
 /// ```dart
 /// import 'package:rivium_ab_testing/rivium_ab_testing.dart';
 ///
-/// // Initialize
-/// await RiviumAbTesting.init(RiviumAbTestingConfig(apiKey: 'rv_live_xxx'));
+/// // Initialize. The token provider returns null while no one is signed in.
+/// await RiviumAbTesting.init(RiviumAbTestingConfig(
+///   apiKey: 'rv_live_xxx',
+///   tokenProvider: fetchRiviumToken,
+/// ));
 ///
 /// // Set user ID
 /// await RiviumAbTesting.instance.setUserId('user-123');

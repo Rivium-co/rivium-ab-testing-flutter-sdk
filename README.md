@@ -12,7 +12,7 @@ A/B Testing and Feature Flags SDK for Flutter with offline-first sync.
 - Feature flags with targeting rules and rollout percentages
 - Sticky bucketing — users stay in the same variant
 - Offline-first event queue with automatic sync
-- Local bucketing with deterministic MD5 hash
+- Safe to start before sign-in: the SDK waits for a user token
 - 17 built-in event types (view, click, conversion, purchase, etc.)
 - Works on **all Flutter platforms** (Android, iOS, Web, macOS, Linux, Windows)
 
@@ -26,7 +26,7 @@ Or add to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  rivium_ab_testing: ^0.2.0
+  rivium_ab_testing: ^0.2.2
 ```
 
 Then run:
@@ -45,7 +45,9 @@ await RiviumAbTesting.init(
   RiviumAbTestingConfig(
     apiKey: 'rv_live_xxx',
     // Your server mints this for the signed-in user (see "User tokens").
+    // Return null while no one is signed in.
     tokenProvider: () async {
+      if (yourSessionToken == null) return null;
       final res = await http.post(Uri.parse('https://your-api.example.com/rivium-token'),
           headers: {'Authorization': 'Bearer $yourSessionToken'});
       return jsonDecode(res.body)['token'] as String;
@@ -53,7 +55,8 @@ await RiviumAbTesting.init(
   ),
 );
 
-// 2. Set user ID (call again on login/logout; the last user's data is dropped)
+// 2. Set user ID: the same id your server puts in the token.
+//    Call it again on login, and clearUserId() on logout.
 await RiviumAbTesting.instance.setUserId('user-123');
 
 // 3. Get variant for an experiment
@@ -76,16 +79,45 @@ prove which user a request is for. Your server can: it holds your project's
 Node.js SDK). The SDK sends it with every request, and the service takes the
 user from the token instead of from the app.
 
-The SDK calls `tokenProvider` when it needs a token, again shortly before it
-expires, and once more if the service reports it expired. Calling `setUserId`
-with a different user sends the last user's pending events first, then drops
-their variants and token.
+The SDK calls `tokenProvider` at start, when it needs a token, again shortly
+before it expires, and once more if the service reports it expired. Call
+`refreshUserToken()` when the user signs in or out. If you would rather fetch
+the token yourself, call `setUserToken(token)` after `init` and again whenever
+you refresh it, and `setUserToken(null)` at sign-out.
+
+The user id you pass to `setUserId` must be the id your server puts in the
+token. Calling `setUserId` with a different user, a token of a different user,
+or `clearUserId()` drops the last user's variants, attributes, token and
+pending events before anything is sent for the next user.
 
 A token is **required**: assigning variants, tracking events and
 evaluating flags are refused without one (reading the experiment and flag
 lists is not, so the app can load them before anyone signs in). The same token works for Rivium Chat and Sync.
 
 **Never put the server secret in the app.**
+
+### Before your user signs in
+
+You can call `init` before anyone is signed in. While there is no token
+(`tokenProvider` returned `null` or failed, or none was set) the SDK is
+**awaiting a user token**: `getVariant` returns the default variant, flags
+come from the cached flag list or their default, events are kept on the device
+(up to 1,000) and nothing is sent, and no error is reported. Once a token
+arrives the SDK fetches the variants you asked for meanwhile (listen for
+`experimentAssigned`) and sends the pending events. Events recorded while no
+one was signed in belong to no user and cannot be credited: only events
+recorded for the user who signs in are sent, the rest are dropped.
+
+```dart
+final ab = RiviumAbTesting.instance;
+
+ab.isAwaitingUserToken;            // true while there is no user token
+ab.onAwaitingUserToken(() { });    // called each time the SDK starts waiting
+
+await ab.refreshUserToken();       // after sign-in or sign-out: ask tokenProvider again
+await ab.setUserToken(token);      // or hand the token over yourself (null = signed out)
+await ab.clearUserId();            // sign-out: forget the user and their data
+```
 
 ## A/B Testing
 
@@ -94,7 +126,7 @@ lists is not, so the app can load them before anyone signs in). The same token w
 ```dart
 final variant = await RiviumAbTesting.instance.getVariant(
   'experiment-key',
-  defaultVariant: 'control', // fallback if offline and no cache
+  defaultVariant: 'control', // returned while the service has not assigned one
 );
 
 if (variant == 'variant-a') {
@@ -110,6 +142,10 @@ if (variant == 'variant-a') {
 final config = await RiviumAbTesting.instance.getVariantConfig('experiment-key');
 // config is a Map<String, dynamic> set in the Rivium dashboard
 ```
+
+The service decides the variant, and the SDK remembers it. `getVariant` never
+throws: without a user, a user token or a connection it returns the remembered
+variant, or `defaultVariant`.
 
 ## Feature Flags
 
@@ -240,7 +276,13 @@ RiviumAbTesting.instance.dispose();
 |---|---|
 | `RiviumAbTesting.init(config)` | Initialize the SDK |
 | `setUserId(id)` | Set user ID for assignment |
+| `clearUserId()` | Forget the user at sign-out |
 | `getUserId()` | Get current user ID |
+| `isAwaitingUserToken` | True while there is no user token |
+| `onAwaitingUserToken(callback)` | Called when the SDK starts waiting for a token |
+| `setUserToken(token)` | Hand over a user token (`null` = signed out) |
+| `refreshUserToken()` | Ask `tokenProvider` again, after sign-in or sign-out |
+| `setTokenProvider(provider)` | Set or remove the token provider after `init` |
 | `setUserAttributes(attrs)` | Set targeting attributes |
 | `getVariant(key)` | Get assigned variant |
 | `getVariantConfig(key)` | Get variant configuration |

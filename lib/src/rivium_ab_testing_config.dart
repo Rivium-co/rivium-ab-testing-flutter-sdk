@@ -11,10 +11,14 @@ class RiviumAbTestingConfig {
   /// trusting the userId this app sends. Called when a token is needed and
   /// again shortly before it expires. Required for
   /// assigning variants, tracking events and evaluating flags. Never put the server secret in the app.
+  ///
+  /// Return null while no one is signed in: the SDK then waits for a token
+  /// ([RiviumAbTesting.isAwaitingUserToken]) instead of failing. Call
+  /// [RiviumAbTesting.refreshUserToken] when the user signs in or out.
   final RiviumTokenProvider? tokenProvider;
 
   /// A user token you already hold. [tokenProvider] is preferred: a static
-  /// token expires.
+  /// token expires. Hand over a newer one with [RiviumAbTesting.setUserToken].
   final String? userToken;
 
   /// Enable debug logging

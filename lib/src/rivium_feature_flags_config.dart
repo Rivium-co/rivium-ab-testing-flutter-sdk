@@ -5,7 +5,8 @@ class RiviumFeatureFlagsConfig {
   /// API key for authentication (format: rv_live_xxx or rv_test_xxx)
   final String apiKey;
 
-  /// Base URL for the API
+  /// Base URL for the API. Must be https; plain http is accepted only for
+  /// local development (localhost, 127.0.0.1, 10.0.2.2).
   final String baseUrl;
 
   /// Returns a Rivium user token for the signed-in user, minted by YOUR
@@ -14,10 +15,14 @@ class RiviumFeatureFlagsConfig {
   /// trusting the userId this app sends. Called when a token is needed and
   /// again shortly before it expires. Required for
   /// assigning variants, tracking events and evaluating flags. Never put the server secret in the app.
+  ///
+  /// Return null while no one is signed in: the SDK then waits for a token
+  /// ([RiviumFeatureFlags.isAwaitingUserToken]) instead of failing. Call
+  /// [RiviumFeatureFlags.refreshUserToken] when the user signs in or out.
   final RiviumTokenProvider? tokenProvider;
 
   /// A user token you already hold. [tokenProvider] is preferred: a static
-  /// token expires.
+  /// token expires. Hand over a newer one with [RiviumFeatureFlags.setUserToken].
   final String? userToken;
 
   /// Enable debug logging

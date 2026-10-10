@@ -1,6 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:crypto/crypto.dart';
-import 'package:connectivity_plus/connectivity_plus.dart';
+import 'platform.dart';
 import 'rivium_feature_flags_config.dart';
 import 'rivium_api_client.dart';
 import 'rivium_ab_testing_error.dart';
@@ -38,6 +39,14 @@ class RiviumFeatureFlags {
   bool _isInitialized = false;
   bool _isOnline = true;
   FeatureFlagCallback? _callback;
+
+  /// False inside RiviumAbTesting, which owns the client and the user.
+  bool _standalone = true;
+  void Function()? _onAwaitingUserToken;
+
+  /// What the service last answered per flag for this user. Preferred over
+  /// evaluating on the device when the service cannot be asked.
+  final Map<String, Map<String, dynamic>> _serverEvaluations = {};
 
   RiviumFeatureFlags._({required RiviumFeatureFlagsConfig config})
       : _config = config;
@@ -79,11 +88,19 @@ class RiviumFeatureFlags {
 
     // Check connectivity
     try {
-      final result = await Connectivity().checkConnectivity();
-      sdk._isOnline = !result.contains(ConnectivityResult.none);
+      sdk._isOnline = await RiviumPlatform.isOnline();
     } catch (_) {
       sdk._isOnline = true; // Assume online if check fails
     }
+
+    sdk._api
+      ..onAwaitingUserToken = sdk._handleAwaitingUserToken
+      ..onTokenUser = sdk._handleTokenUser
+      ..onSignedOut = sdk._forgetUser
+      ..onTokenRejected = (code) => sdk._callback?.call('error', {
+            'message': 'User token rejected: $code',
+            'code': code,
+          });
 
     sdk._isInitialized = true;
     _instance = sdk;
@@ -94,6 +111,9 @@ class RiviumFeatureFlags {
     }
 
     callback?.call('initialized', {'offline': !sdk._isOnline});
+
+    // Without a user token yet, the SDK waits for one.
+    unawaited(sdk._api.start());
 
     return sdk;
   }
@@ -117,6 +137,7 @@ class RiviumFeatureFlags {
     final sdk = RiviumFeatureFlags._(config: config);
     // Shares the parent SDK's client, so both send the same user token.
     sdk._api = api ?? RiviumApiClient(apiKey: apiKey, baseUrl: baseUrl, debug: debug);
+    sdk._standalone = false;
     sdk._storage = storage;
     sdk._callback = callback;
     sdk._cachedFlags = await storage.getCachedFlags();
@@ -126,48 +147,90 @@ class RiviumFeatureFlags {
   }
 
   /// Set user ID for rollout and targeting
+  ///
+  /// Use the same id your server puts in the user token.
   Future<void> setUserId(String userId) async {
-    _ensureInitialized();
-    if (userId != _userId) {
+    if (!_isInitialized) return;
+    final changed = userId != _userId;
+    if (changed) {
       // Another person: the last user's attributes and token are not theirs.
       _userAttributes = {};
-      _api.clearToken();
+      _serverEvaluations.clear();
+      if (_standalone) _api.clearToken(keepUnidentified: true);
     }
     _userId = userId;
     await _storage?.saveUserId(userId);
+    if (_standalone && changed) unawaited(_api.start());
+  }
+
+  /// Forget the user, for example at sign-out: their id, attributes and
+  /// token are dropped and the SDK waits for the next user token.
+  Future<void> clearUserId() async {
+    if (!_isInitialized) return;
+    if (_standalone) {
+      // Clears the user through onSignedOut.
+      await _api.setUserToken(null);
+    } else {
+      await _forgetUser();
+    }
   }
 
   /// Get current user ID
   String? getUserId() => _userId;
 
+  /// True while the SDK has no user token: nobody is signed in yet, or the
+  /// token provider returned null or failed. Flags are then evaluated from
+  /// the cached flag list, or the default value is returned; nothing is sent.
+  bool get isAwaitingUserToken => _api.isAwaitingUserToken;
+
+  /// Called each time the SDK starts waiting for a user token. The
+  /// `awaitingUserToken` event of the init callback reports the same.
+  void onAwaitingUserToken(void Function() callback) {
+    _onAwaitingUserToken = callback;
+  }
+
+  /// Hand the SDK a user token minted by your server, for example right
+  /// after sign-in or when you refreshed it. A token of another user drops
+  /// the last user's attributes first.
+  ///
+  /// Pass `null` when the user signs out.
+  Future<void> setUserToken(String? token) async {
+    if (!_isInitialized) return;
+    await _api.setUserToken(token);
+  }
+
+  /// Set or remove the token provider after [init]. The provider is asked
+  /// straight away.
+  Future<void> setTokenProvider(RiviumTokenProvider? provider) async {
+    if (!_isInitialized) return;
+    await _api.setTokenProvider(provider);
+  }
+
+  /// Ask the token provider again now. Call this when the user signs in or
+  /// out. Does nothing without a provider.
+  Future<void> refreshUserToken() async {
+    if (!_isInitialized) return;
+    await _api.refreshUserToken();
+  }
+
   /// Set user attributes for targeting rules
   void setUserAttributes(Map<String, dynamic> attributes) {
-    _ensureInitialized();
+    if (!_isInitialized) return;
     _userAttributes = {..._userAttributes, ...attributes};
+    _serverEvaluations.clear();
   }
 
   /// Check if a feature flag is enabled
+  ///
+  /// The service decides. Its last answer, then the cached flag list, are
+  /// used when it cannot be asked (offline, or no user token yet).
   Future<bool> isEnabled(String flagKey, {bool defaultValue = false}) async {
-    _ensureInitialized();
+    if (!_isInitialized) return defaultValue;
 
-    // Try server evaluation if online
-    if (_isOnline) {
-      try {
-        final response = await _api.post('/public/flag-evaluation', {
-          'flagKey': flagKey,
-          'userId': _userId ?? '',
-          'userAttributes': _userAttributes,
-        });
-
-        if (response.statusCode == 200) {
-          final data = jsonDecode(response.body);
-          return data['enabled'] as bool? ?? defaultValue;
-        }
-      } catch (e) {
-        if (_config.debug) {
-          print('RiviumFeatureFlags: Failed to evaluate flag: $e');
-        }
-      }
+    final evaluation = await _evaluateOnServer(flagKey);
+    if (evaluation != null) {
+      final enabled = evaluation['enabled'];
+      return enabled is bool ? enabled : defaultValue;
     }
 
     // Offline fallback: local evaluation
@@ -181,26 +244,11 @@ class RiviumFeatureFlags {
 
   /// Get the value of a feature flag
   Future<dynamic> getValue(String flagKey, {dynamic defaultValue}) async {
-    _ensureInitialized();
+    if (!_isInitialized) return defaultValue;
 
-    // Try server evaluation if online
-    if (_isOnline) {
-      try {
-        final response = await _api.post('/public/flag-evaluation', {
-          'flagKey': flagKey,
-          'userId': _userId ?? '',
-          'userAttributes': _userAttributes,
-        });
-
-        if (response.statusCode == 200) {
-          final data = jsonDecode(response.body);
-          return data['value'] ?? defaultValue;
-        }
-      } catch (e) {
-        if (_config.debug) {
-          print('RiviumFeatureFlags: Failed to get flag value: $e');
-        }
-      }
+    final evaluation = await _evaluateOnServer(flagKey);
+    if (evaluation != null) {
+      return evaluation['value'] ?? defaultValue;
     }
 
     // Offline fallback: local evaluation
@@ -215,7 +263,7 @@ class RiviumFeatureFlags {
 
   /// Get all feature flags
   Future<List<FeatureFlag>> getAll() async {
-    _ensureInitialized();
+    if (!_isInitialized) return [];
 
     if (_isOnline) {
       try {
@@ -283,7 +331,7 @@ class RiviumFeatureFlags {
 
   /// Refresh flags from server
   Future<void> refresh() async {
-    _ensureInitialized();
+    if (!_isInitialized) return;
     await _fetchFlags();
   }
 
@@ -304,9 +352,10 @@ class RiviumFeatureFlags {
     _cachedFlags = [];
     _userId = null;
     _userAttributes = {};
-    _api.clearToken();
+    _serverEvaluations.clear();
+    if (_standalone) _api.clearToken();
     _isInitialized = false;
-    _instance = null;
+    if (identical(_instance, this)) _instance = null;
   }
 
   /// Dispose resources
@@ -318,10 +367,59 @@ class RiviumFeatureFlags {
   // PRIVATE METHODS
   // ============================================
 
-  void _ensureInitialized() {
-    if (!_isInitialized) {
-      throw RiviumAbTestingError.notInitialized();
+  /// The service's answer for [flagKey]: fresh when it can be asked, else
+  /// its last answer for this user. Null when there is none.
+  Future<Map<String, dynamic>?> _evaluateOnServer(String flagKey) async {
+    final userId = _userId;
+    if (_isOnline && userId != null) {
+      try {
+        final response = await _api.post(
+          '/public/flag-evaluation',
+          {
+            'flagKey': flagKey,
+            'userId': userId,
+            'userAttributes': _userAttributes,
+          },
+          userId: userId,
+        );
+
+        if (response != null &&
+            response.statusCode >= 200 &&
+            response.statusCode < 300) {
+          final data = jsonDecode(response.body);
+          if (data is Map<String, dynamic> && userId == _userId) {
+            _serverEvaluations[flagKey] = data;
+            return data;
+          }
+        }
+      } catch (e) {
+        if (_config.debug) {
+          print('RiviumFeatureFlags: Failed to evaluate flag: $e');
+        }
+      }
     }
+    return _serverEvaluations[flagKey];
+  }
+
+  void _handleAwaitingUserToken() {
+    _callback?.call('awaitingUserToken', null);
+    _onAwaitingUserToken?.call();
+  }
+
+  /// A token of [userId] is about to be used.
+  Future<void> _handleTokenUser(String userId) async {
+    if (userId == _userId) return;
+    _userAttributes = {};
+    _serverEvaluations.clear();
+    _userId = userId;
+    await _storage?.saveUserId(userId);
+  }
+
+  Future<void> _forgetUser() async {
+    _userId = null;
+    _userAttributes = {};
+    _serverEvaluations.clear();
+    if (_standalone) await _storage?.removeUserId();
   }
 
   Future<void> _fetchFlags() async {
@@ -371,8 +469,8 @@ class RiviumFeatureFlags {
     }
   }
 
-  /// Evaluate a feature flag locally (offline fallback)
-  /// Matches backend algorithm in feature-flags.service.ts
+  /// Evaluate a feature flag locally (offline fallback). An approximation:
+  /// the service's own answer is used whenever there is one.
   _FlagEvalResult _evaluateFlagLocally(CachedFeatureFlag flag) {
     if (!flag.enabled) {
       return _FlagEvalResult(
@@ -391,10 +489,12 @@ class RiviumFeatureFlags {
       }
     }
 
-    // Check rollout percentage
-    if (_userId != null) {
-      final rolloutHash = _getBucket(_userId!, flag.key);
-      if (rolloutHash >= flag.rolloutPercentage) {
+    // Check rollout percentage. Without a user there is no bucket, so a
+    // partial rollout is off rather than on for everyone.
+    if (flag.rolloutPercentage < 100) {
+      final userId = _userId;
+      if (userId == null ||
+          _getBucket(userId, flag.key) >= flag.rolloutPercentage) {
         return _FlagEvalResult(
           enabled: false,
           value: flag.defaultValue ?? false,
