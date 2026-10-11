@@ -26,7 +26,7 @@ Or add to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  rivium_ab_testing: ^0.2.2
+  rivium_ab_testing: ^0.2.3
 ```
 
 Then run:

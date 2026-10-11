@@ -24,8 +24,15 @@ class RiviumAbTestingConfig {
   /// Enable debug logging
   final bool debug;
 
-  /// Interval for flushing events (in milliseconds)
+  /// Interval for flushing events (in milliseconds).
+  ///
+  /// Leave it out to follow the send interval set in the Rivium console
+  /// (30 seconds until the console's value is known). A value you pass is
+  /// your own choice and is always used.
   final int flushInterval;
+
+  /// True when [flushInterval] was passed to the constructor.
+  final bool hasOwnFlushInterval;
 
   /// Maximum events to queue before forcing flush
   final int maxQueueSize;
@@ -38,10 +45,11 @@ class RiviumAbTestingConfig {
     this.tokenProvider,
     this.userToken,
     this.debug = false,
-    this.flushInterval = 30000,
+    int? flushInterval,
     this.maxQueueSize = 100,
     this.autoTrack = true,
-  });
+  })  : flushInterval = flushInterval ?? 30000,
+        hasOwnFlushInterval = flushInterval != null;
 
   /// Create config from API key only
   factory RiviumAbTestingConfig.fromApiKey(String apiKey) {

@@ -10,11 +10,13 @@ class RiviumPlatform {
   static http.Client Function() httpClient = _defaultHttpClient;
   static Future<bool> Function() isOnline = _defaultIsOnline;
   static Stream<bool> Function() onlineChanges = _defaultOnlineChanges;
+  static DateTime Function() now = DateTime.now;
 
   static void restoreDefaults() {
     httpClient = _defaultHttpClient;
     isOnline = _defaultIsOnline;
     onlineChanges = _defaultOnlineChanges;
+    now = DateTime.now;
   }
 
   static http.Client _defaultHttpClient() => http.Client();

@@ -11,6 +11,7 @@ import 'models/feature_flag.dart';
 import 'models/variant.dart';
 import 'offline/offline_storage.dart';
 import 'offline/sync_manager.dart';
+import 'platform.dart';
 
 /// Callback for SDK events
 typedef RiviumAbTestingCallback = void Function(
@@ -45,6 +46,13 @@ class RiviumAbTesting {
   /// Variants the service gave to a user who is not part of the experiment
   /// (targeting, traffic). Kept for this run only: never a sticky assignment.
   final Map<String, String> _notInExperiment = {};
+
+  /// When the experiment list last came from the service, and when a
+  /// refresh that failed may be tried again.
+  DateTime? _listFetchedAt;
+  DateTime? _listRetryAt;
+  bool _refreshingList = false;
+  static const Duration _listRetryDelay = Duration(seconds: 60);
 
   RiviumAbTesting._({
     required RiviumAbTestingConfig config,
@@ -101,6 +109,8 @@ class RiviumAbTesting {
       storage: sdk._storage,
       onSyncEvent: sdk._onSyncEvent,
       currentUserId: () => sdk._userId,
+      ownSyncIntervalSeconds:
+          config.hasOwnFlushInterval ? config.flushInterval ~/ 1000 : null,
     );
     try {
       await sdk._syncManager.init();
@@ -259,6 +269,7 @@ class RiviumAbTesting {
     String defaultVariant = 'control',
   }) async {
     if (!_usable('getVariant')) return defaultVariant;
+    _refreshListIfStale();
 
     try {
       // Check cached assignment (sticky bucketing)
@@ -781,6 +792,7 @@ class RiviumAbTesting {
     Map<String, dynamic>? metadata,
   }) async {
     if (!_usable('track')) return;
+    _refreshListIfStale();
 
     // Resolve experiment UUID and variant UUID from cached data
     String experimentId = experimentKey;
@@ -822,8 +834,28 @@ class RiviumAbTesting {
     }
   }
 
-  /// Fetch experiments from /public/experiments (has key fields)
-  Future<void> _fetchExperiments() async {
+  /// The experiment list is older than the console allows: ask again in the
+  /// background. The caller is never kept waiting and goes on with the list
+  /// it has. Only one refresh runs at a time.
+  void _refreshListIfStale() {
+    if (_refreshingList || !_syncManager.isOnline) return;
+    final now = RiviumPlatform.now();
+    final retryAt = _listRetryAt;
+    if (retryAt != null && now.isBefore(retryAt)) return;
+    final fetchedAt = _listFetchedAt;
+    if (fetchedAt != null) {
+      final age = now.difference(fetchedAt);
+      if (!age.isNegative && age < _syncManager.listCache) return;
+    }
+    unawaited(_fetchExperiments(quietly: true));
+  }
+
+  /// Fetch experiments from /public/experiments (has key fields). True when
+  /// the list arrived. [quietly]: a failure is not reported (a refresh the
+  /// app did not ask for).
+  Future<bool> _fetchExperiments({bool quietly = false}) async {
+    var fetched = false;
+    _refreshingList = true;
     try {
       // Fetch experiments (has key fields) and config in parallel
       final results = await Future.wait([
@@ -866,6 +898,8 @@ class RiviumAbTesting {
         }).toList();
 
         await _storage.cacheExperiments(_cachedExperiments);
+        _listFetchedAt = RiviumPlatform.now();
+        fetched = true;
 
         _callback?.call(
             'experimentsRefreshed', {'count': _cachedExperiments.length});
@@ -890,9 +924,16 @@ class RiviumAbTesting {
       if (_config.debug) {
         print('RiviumAbTesting: Failed to fetch experiments: $e');
       }
-      _callback?.call(
-          'error', {'message': 'Failed to fetch experiments: $e'});
+      if (!quietly) {
+        _callback?.call(
+            'error', {'message': 'Failed to fetch experiments: $e'});
+      }
+    } finally {
+      _refreshingList = false;
+      _listRetryAt =
+          fetched ? null : RiviumPlatform.now().add(_listRetryDelay);
     }
+    return fetched;
   }
 
   static final Random _random = _secureRandom();

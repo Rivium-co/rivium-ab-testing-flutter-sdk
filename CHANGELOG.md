@@ -1,3 +1,11 @@
+## 0.2.3
+
+- Follows the list cache set in the Rivium console: the experiment list is
+  asked for again once it is older than the console allows.
+- A `flushInterval` you pass now wins over the console's send interval; leave
+  it out to follow the console. Changes apply while the app runs.
+- Sends each event's own time as milliseconds.
+
 ## 0.2.2
 
 - Waits for a user token when the app starts before sign-in: `getVariant` returns

@@ -8,6 +8,9 @@ import 'offline_storage.dart';
 /// Configuration for sync manager
 class SyncConfig {
   final int syncIntervalSeconds;
+
+  /// How long the experiment list is used before the service is asked again.
+  final int cacheTtlSeconds;
   final int maxBatchSize;
   final int maxOfflineEvents;
   final int maxRetries;
@@ -15,18 +18,39 @@ class SyncConfig {
 
   const SyncConfig({
     this.syncIntervalSeconds = 30,
+    this.cacheTtlSeconds = 300,
     this.maxBatchSize = 100,
     this.maxOfflineEvents = 1000,
     this.maxRetries = 3,
     this.retryDelay = const Duration(seconds: 5),
   });
 
+  /// What the console says. Whatever it says, events are never sent more
+  /// often than every 10 seconds and the list is never asked for more than
+  /// once a minute; a value that is missing or not a whole number above zero
+  /// is the built-in one.
   factory SyncConfig.fromJson(Map<String, dynamic> json) => SyncConfig(
-        syncIntervalSeconds: json['syncIntervalSeconds'] as int? ?? 30,
-        maxBatchSize: json['maxBatchSize'] as int? ?? 100,
-        maxOfflineEvents: json['maxOfflineEvents'] as int? ?? 1000,
-        maxRetries: json['maxRetries'] as int? ?? 3,
+        syncIntervalSeconds:
+            _bounded(json['syncIntervalSeconds'], 10, 3600, 30),
+        cacheTtlSeconds: _bounded(json['cacheTtlSeconds'], 60, 86400, 300),
+        maxBatchSize: _whole(json['maxBatchSize']) ?? 100,
+        maxOfflineEvents: _whole(json['maxOfflineEvents']) ?? 1000,
+        maxRetries: _whole(json['maxRetries']) ?? 3,
       );
+
+  static int? _whole(Object? value) {
+    if (value is int) return value;
+    if (value is double && value.isFinite && value == value.roundToDouble()) {
+      return value.toInt();
+    }
+    return null;
+  }
+
+  static int _bounded(Object? value, int min, int max, int fallback) {
+    final whole = _whole(value);
+    if (whole == null || whole < 1) return fallback;
+    return whole < min ? min : (whole > max ? max : whole);
+  }
 }
 
 /// Callback for sync events
@@ -51,6 +75,10 @@ class SyncManager {
   /// a batch to the token's user, so only this user's events may be sent.
   final String? Function()? currentUserId;
 
+  /// The send interval the app chose itself, in seconds. It wins over the
+  /// console's. Null: follow the console.
+  final int? ownSyncIntervalSeconds;
+
   /// The queue never holds more events than this, whatever the config says.
   static const int queueLimit = 1000;
 
@@ -74,8 +102,20 @@ class SyncManager {
     required this.storage,
     this.onSyncEvent,
     this.currentUserId,
+    this.ownSyncIntervalSeconds,
     SyncConfig? config,
   }) : _config = config ?? const SyncConfig();
+
+  /// How often events are sent, in seconds.
+  int get syncIntervalSeconds {
+    final own = ownSyncIntervalSeconds;
+    if (own != null) return own < 1 ? 1 : own;
+    final seconds = _config.syncIntervalSeconds;
+    return seconds < 1 ? 30 : seconds;
+  }
+
+  /// How long the experiment list is used before the service is asked again.
+  Duration get listCache => Duration(seconds: _config.cacheTtlSeconds);
 
   int get _queueSize {
     final size = _config.maxOfflineEvents;
@@ -114,8 +154,10 @@ class SyncManager {
 
   /// Update sync configuration
   void updateConfig(SyncConfig config) {
+    final before = syncIntervalSeconds;
     _config = config;
-    _startSyncTimer();
+    // The timer keeps its rhythm unless the interval really changed.
+    if (_syncTimer == null || syncIntervalSeconds != before) _startSyncTimer();
   }
 
   /// Queue an event for sync
@@ -211,7 +253,7 @@ class SyncManager {
                     'eventName': e.eventName,
                     'eventValue': e.eventValue,
                     'metadata': e.metadata,
-                    'timestamp': e.timestamp.toIso8601String(),
+                    'timestamp': e.timestamp.millisecondsSinceEpoch,
                     'clientEventId': e.id,
                   })
               .toList(),
@@ -345,8 +387,7 @@ class SyncManager {
   SyncResult _failed(String error, int pending) {
     _failures++;
     final doublings = _failures > 6 ? 6 : _failures - 1;
-    final interval = _config.syncIntervalSeconds;
-    final wait = Duration(seconds: (interval < 1 ? 30 : interval) << doublings);
+    final wait = Duration(seconds: syncIntervalSeconds << doublings);
     _backoffUntil =
         DateTime.now().add(wait > _maxBackoff ? _maxBackoff : wait);
     _report(error);
@@ -375,9 +416,8 @@ class SyncManager {
 
   void _startSyncTimer() {
     _syncTimer?.cancel();
-    final seconds = _config.syncIntervalSeconds;
     _syncTimer = Timer.periodic(
-      Duration(seconds: seconds < 1 ? 30 : seconds),
+      Duration(seconds: syncIntervalSeconds),
       (_) {
         if (_isOnline) {
           sync();

@@ -51,6 +51,16 @@ class FakeService {
   List<Map<String, dynamic>> flags = [];
   int assignStatus = 200;
 
+  /// The `config` object of `/public/init`; null leaves it out.
+  Map<String, dynamic>? config;
+
+  /// The status every GET answers with.
+  int readStatus = 200;
+
+  List<http.Request> gets(String path) => requests
+      .where((r) => r.method == 'GET' && r.url.path == path)
+      .toList();
+
   List<http.Request> posts([String? path]) => requests
       .where((r) => r.method == 'POST' && (path == null || r.url.path == path))
       .toList();
@@ -59,9 +69,14 @@ class FakeService {
         requests.add(request);
         final path = request.url.path;
         if (request.method == 'GET') {
+          if (readStatus != 200) return json({}, readStatus);
           if (path == '/public/experiments') return json({'data': experiments});
           if (path == '/public/flags') return json({'flags': flags});
-          return json({'experiments': [], 'serverTime': 'now'});
+          return json({
+            'experiments': [],
+            if (config != null) 'config': config,
+            'serverTime': 'now',
+          });
         }
         final custom = onPost?.call(request);
         if (custom != null) return custom;
